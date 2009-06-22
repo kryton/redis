@@ -60,6 +60,7 @@
 #include "anet.h"   /* Networking the easy way */
 #include "dict.h"   /* Hash tables */
 #include "adlist.h" /* Linked lists */
+#include "adRRlist.h" /* Round Robin lists */
 #include "zmalloc.h" /* total memory usage aware version of malloc/free */
 #include "lzf.h"    /* LZF compression library */
 #include "pqsort.h" /* Partial qsort for SORT+LIMIT */
@@ -100,6 +101,7 @@
 #define REDIS_LIST 1
 #define REDIS_SET 2
 #define REDIS_HASH 3
+#define REDIS_RRS 4
 
 /* Object types only used for dumping to disk */
 #define REDIS_EXPIRETIME 253
@@ -300,13 +302,15 @@ struct sharedObjectsStruct {
     *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
     *outofrangeerr, *plus,
     *select0, *select1, *select2, *select3, *select4,
-    *select5, *select6, *select7, *select8, *select9;
+    *select5, *select6, *select7, *select8, *select9,
+    *keyexists;
 } shared;
 
 /*================================ Prototypes =============================== */
 
 static void freeStringObject(robj *o);
 static void freeListObject(robj *o);
+static void freeRRSObject(robj *o);
 static void freeSetObject(robj *o);
 static void decrRefCount(void *o);
 static robj *createObject(int type, void *ptr);
@@ -388,6 +392,11 @@ static void expireCommand(redisClient *c);
 static void getSetCommand(redisClient *c);
 static void ttlCommand(redisClient *c);
 static void slaveofCommand(redisClient *c);
+static void rrsCreateCommand(redisClient *c);
+static void rrsAddCommand(redisClient *c);
+static void rrsGetCommand(redisClient *c);
+static void rrsListCommand(redisClient *c);
+
 static void debugCommand(redisClient *c);
 /*================================= Globals ================================= */
 
@@ -453,6 +462,17 @@ static struct redisCommand cmdTable[] = {
     {"ttl",ttlCommand,2,REDIS_CMD_INLINE},
     {"slaveof",slaveofCommand,3,REDIS_CMD_INLINE},
     {"debug",debugCommand,-2,REDIS_CMD_INLINE},
+    {"rrscreate",rrsCreateCommand,4,REDIS_CMD_INLINE},
+    {"rrsadd",rrsAddCommand,3,REDIS_CMD_INLINE},
+    {"rrsget",rrsGetCommand,3,REDIS_CMD_INLINE},
+    {"rrslist",rrsListCommand,4,REDIS_CMD_INLINE},
+    /*
+    {"rrdcreate",rrdCreateCommand,4,REDIS_CMD_INLINE},
+    {"rrdadd",rrdAddCommand,3,REDIS_CMD_INLINE},
+    {"rrdget",rrdGetCommand,3,REDIS_CMD_INLINE},
+    
+    {"rrdlist",rrdListCommand,4,REDIS_CMD_INLINE},
+    */
     {NULL,NULL,0,0}
 };
 /*============================ Utility functions ============================ */
@@ -855,6 +875,8 @@ static void createSharedObjects(void) {
         "-ERR source and destination objects are the same\r\n"));
     shared.outofrangeerr = createObject(REDIS_STRING,sdsnew(
         "-ERR index out of range\r\n"));
+    shared.keyexists = createObject(REDIS_STRING,sdsnew(
+        "-ERR key already exists\r\n"));
     shared.space = createObject(REDIS_STRING,sdsnew(" "));
     shared.colon = createObject(REDIS_STRING,sdsnew(":"));
     shared.plus = createObject(REDIS_STRING,sdsnew("+"));
@@ -1625,6 +1647,17 @@ static robj *createListObject(void) {
     return createObject(REDIS_LIST,l);
 }
 
+static robj *createRRSListObject(int period, int numperiod) {
+    RRSlist *l = listRRSCreate(period, numperiod);
+
+    if (!l) oom("listRRSCreate");
+    listSetFreeMethod(l,decrRefCount);
+    return createObject(REDIS_RRS,l);
+}
+
+
+
+
 static robj *createSetObject(void) {
     dict *d = dictCreate(&setDictType,NULL);
     if (!d) oom("dictCreate");
@@ -1638,6 +1671,11 @@ static void freeStringObject(robj *o) {
 static void freeListObject(robj *o) {
     listRelease((list*) o->ptr);
 }
+
+static void freeRRSObject(robj *o) {
+    listRRSRelease((RRSlist*) o->ptr);
+}
+
 
 static void freeSetObject(robj *o) {
     dictRelease((dict*) o->ptr);
@@ -1668,6 +1706,7 @@ static void decrRefCount(void *obj) {
         case REDIS_LIST: freeListObject(o); break;
         case REDIS_SET: freeSetObject(o); break;
         case REDIS_HASH: freeHashObject(o); break;
+        case REDIS_RRS: freeRRSObject(o); break;
         default: assert(0 != 0); break;
         }
         if (listLength(server.objfreelist) > REDIS_OBJFREELIST_MAX ||
@@ -1960,6 +1999,8 @@ static int rdbSave(char *filename) {
                     if (rdbSaveStringObject(fp,eleobj) == -1) goto werr;
                 }
                 dictReleaseIterator(di);
+                // TODO
+            } else if (o->type == REDIS_RRS) {
             } else {
                 assert(0 != 0);
             }
@@ -2215,21 +2256,26 @@ static int rdbLoad(char *filename) {
                         oom("dictAdd");
                 }
             }
+        // TODO add RRS support
+        } else if (type == REDIS_RRS) { 
+            o = NULL;
         } else {
             assert(0 != 0);
         }
         /* Add the new object in the hash table */
-        retval = dictAdd(d,keyobj,o);
-        if (retval == DICT_ERR) {
-            redisLog(REDIS_WARNING,"Loading DB, duplicated key (%s) found! Unrecoverable error, exiting now.", keyobj->ptr);
-            exit(1);
-        }
-        /* Set the expire time if needed */
-        if (expiretime != -1) {
-            setExpire(db,keyobj,expiretime);
-            /* Delete this key if already expired */
-            if (expiretime < now) deleteKey(db,keyobj);
-            expiretime = -1;
+        if ( o != NULL ) {
+            retval = dictAdd(d,keyobj,o);
+            if (retval == DICT_ERR) {
+                redisLog(REDIS_WARNING,"Loading DB, duplicated key (%s) found! Unrecoverable error, exiting now.", keyobj->ptr);
+                exit(1);
+            }
+            /* Set the expire time if needed */
+            if (expiretime != -1) {
+                setExpire(db,keyobj,expiretime);
+                /* Delete this key if already expired */
+                if (expiretime < now) deleteKey(db,keyobj);
+                expiretime = -1;
+            }
         }
         keyobj = o = NULL;
     }
@@ -3745,6 +3791,134 @@ static void ttlCommand(redisClient *c) {
     addReplySds(c,sdscatprintf(sdsempty(),":%d\r\n",ttl));
 }
 
+
+
+static void rrsCreateCommand(redisClient *c) {
+    robj *o;
+    
+    int period = atoi(c->argv[2]->ptr);
+    int numperiod = atoi(c->argv[3]->ptr);
+    
+    o = lookupKeyWrite(c->db,c->argv[1]);
+    if (o != NULL) {
+        addReply(c,shared.keyexists);
+    } else {
+        o = createRRSListObject(period,numperiod);
+        if ( o == NULL ) {
+            addReply(c,shared.err);
+        } else {
+            dictAdd(c->db->dict,c->argv[1], o);
+            incrRefCount(c->argv[1]);
+            addReply(c,shared.ok);
+            server.dirty++;
+        }
+    }
+}
+
+static void rrsAddCommand(redisClient *c) {
+    robj *o;
+    
+    o = lookupKeyWrite(c->db,c->argv[1]);
+
+    if (o == NULL) {
+        addReply(c,shared.nokeyerr);
+    } else {
+        if (o->type != REDIS_RRS ) {
+            addReply(c,shared.wrongtypeerr);
+        }
+        else {
+            RRSlist *list = o->ptr;
+            if ( listRRSAdd(list, atol(((char*)c->argv[2]->ptr)), time(NULL)) == NULL) oom("listRRSAdd");
+            addReply(c,shared.ok);
+            incrRefCount(c->argv[2]);
+            server.dirty++;
+        }
+    }
+}
+static void rrsGetCommand(redisClient *c) {
+    robj *o;
+    
+    o = lookupKeyWrite(c->db,c->argv[1]);
+
+    if (o == NULL) {
+        addReply(c,shared.nokeyerr);
+    } else {
+        if (o->type != REDIS_RRS ) {
+            addReply(c,shared.wrongtypeerr);
+        }
+        else {
+            RRSlist *list = o->ptr;
+            time_t timeP;
+            if ( strcasecmp((char*)c->argv[2]->ptr,"NOW") ==0 ) {
+                timeP= time(NULL);
+            }
+            else {
+                timeP = atol( (char*)c->argv[2]->ptr);
+                if ( timeP == 0 ) {
+                    timeP= time(NULL);
+                }
+            }
+
+            listRRSNode *node =  listRRSGet(list, timeP);
+            if ( node ) {
+                sds reply = sdscatprintf(sdsempty(),"%ld\t%ld\t%ld\t%ld\t%ld", list->period*node->periodvalue, node->value, node->count, node->min, node->max);
+                addReplySds(c,sdscatprintf(sdsempty(),"$%d\r\n", (int)sdslen( reply ) ));
+                addReplySds(c,reply);
+                addReply(c,shared.crlf);
+            //    sdsfree(reply);
+            } else {
+                addReply(c,shared.emptybulk);
+            }
+        }
+    }
+}
+
+static void rrsListCommand(redisClient *c) {
+    robj *o;
+    
+    o = lookupKeyWrite(c->db,c->argv[1]);
+
+    if (o == NULL) {
+        addReply(c,shared.nokeyerr);
+    } else {
+        if (o->type != REDIS_RRS ) {
+            addReply(c,shared.wrongtypeerr);
+        }
+        else {
+            RRSlist *list = o->ptr;
+            time_t timeP;
+            if ( strcasecmp((char*)c->argv[2]->ptr,"NOW") ==0 ) {
+                timeP= time(NULL);
+            }
+            else {
+                timeP = atol( (char*)c->argv[2]->ptr);
+                if ( timeP == 0 ) {
+                    timeP= time(NULL);
+                }
+            }
+
+            addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n", list->numperiods ));
+
+            for (int i=0;i < list->numperiods;i++) {
+                listRRSNode *node;// =  listRRSGet(list, timeP);
+                node = list->values[i];
+                sds reply;
+                if ( node->count > 0 ) {
+                    reply = sdscatprintf(sdsempty(),"%ld\t%ld\t%ld\t%ld\t%ld", list->period*node->periodvalue, node->value, node->count, node->min, node->max);
+                }
+                else {
+                    reply = sdscatprintf(sdsempty(),"%ld\t%ld\t%ld\t%ld\t%ld", 0L, 0L, 0L, 0L, 0L);
+                }
+                addReplySds(c,sdscatprintf(sdsempty(),"$%d\r\n", (int)sdslen( reply ) ));
+                addReplySds(c,reply);
+                addReply(c,shared.crlf);
+            }
+        }
+    }
+}
+
+
+
 /* =============================== Replication  ============================= */
 
 static int syncWrite(int fd, char *ptr, ssize_t size, int timeout) {
@@ -4147,6 +4321,7 @@ static void debugCommand(redisClient *c) {
 static struct redisFunctionSym symsTable[] = {
 {"freeStringObject", (unsigned long)freeStringObject},
 {"freeListObject", (unsigned long)freeListObject},
+{"freeRRSObject", (unsigned long)freeRRSObject},
 {"freeSetObject", (unsigned long)freeSetObject},
 {"decrRefCount", (unsigned long)decrRefCount},
 {"createObject", (unsigned long)createObject},
