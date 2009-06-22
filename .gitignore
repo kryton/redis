@@ -1,5 +1,6 @@
 *.o
 *.rdb
+*~
 redis-cli
 redis-server
 redis-benchmark
